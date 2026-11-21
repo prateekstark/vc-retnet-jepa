@@ -1,4 +1,4 @@
-"""Multi-speaker dataset loader with MFCC Dynamic Time Warping (DTW) alignment for parallel pairs."""
+"""Multi-speaker dataset loader with Smooth Sub-Frame Interpolated CMVN-MFCC DTW alignment."""
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -7,29 +7,29 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.fftpack import dct
+from scipy.ndimage import gaussian_filter1d
 from torch.utils.data import Dataset
 
 from src.audio.mel_vocoder import LogMelFrontend, crop_or_pad, load_wav
 
 
 def dtw_align_mel_a_to_b(mel_a: torch.Tensor, mel_b: torch.Tensor) -> torch.Tensor:
-    """Warp mel_a (1, n_mels, T_a) onto mel_b's timeline (1, n_mels, T_b) using CMVN-MFCC DTW.
+    """Warp mel_a (1, n_mels, T_a) onto mel_b's timeline (1, n_mels, T_b) using Smooth Interpolated DTW.
 
-    By using cepstral mean-variance normalized MFCCs (c1..c13, excluding c0 energy and high pitch harmonics),
-    the DTW cost is invariant to speaker pitch/timbre and aligns pure phonetic timing.
+    1. Computes CMVN-MFCCs (c1..c13) for speaker-invariant phonetic alignment.
+    2. Finds optimal DTW path mapping each frame i in B -> continuous coordinate tau(i) in A.
+    3. Smooths tau(i) with a 1D Gaussian kernel (sigma=1.2) to eliminate discrete step-repetition
+       staircase artifacts on consonant bursts, then interpolates mel_a at continuous tau(i).
     """
     a_np = mel_a.squeeze(0).cpu().numpy()  # (n_mels, T_a)
     b_np = mel_b.squeeze(0).cpu().numpy()  # (n_mels, T_b)
 
-    # Extract MFCCs c1..c13 via Type-II DCT along frequency axis
-    mfcc_a = dct(a_np, type=2, axis=0, norm="ortho")[1:14, :]  # (13, T_a)
-    mfcc_b = dct(b_np, type=2, axis=0, norm="ortho")[1:14, :]  # (13, T_b)
+    mfcc_a = dct(a_np, type=2, axis=0, norm="ortho")[1:14, :]
+    mfcc_b = dct(b_np, type=2, axis=0, norm="ortho")[1:14, :]
 
-    # Cepstral Mean and Variance Normalization (CMVN) per utterance removes speaker timbre bias
     mfcc_a = (mfcc_a - mfcc_a.mean(axis=1, keepdims=True)) / (mfcc_a.std(axis=1, keepdims=True) + 1e-5)
     mfcc_b = (mfcc_b - mfcc_b.mean(axis=1, keepdims=True)) / (mfcc_b.std(axis=1, keepdims=True) + 1e-5)
 
-    # L2 normalize frames for cosine distance cost matrix (T_b, T_a)
     mfcc_a /= np.linalg.norm(mfcc_a, axis=0, keepdims=True) + 1e-6
     mfcc_b /= np.linalg.norm(mfcc_b, axis=0, keepdims=True) + 1e-6
     cost = 1.0 - np.dot(mfcc_b.T, mfcc_a)  # (T_b, T_a)
@@ -37,7 +37,6 @@ def dtw_align_mel_a_to_b(mel_a: torch.Tensor, mel_b: torch.Tensor) -> torch.Tens
     tb, ta = cost.shape
     D = np.full((tb + 1, ta + 1), np.inf, dtype=np.float32)
     D[0, 0] = 0.0
-    # Sakoe-Chiba band constraint (35% of sequence length) for speed and monotonic speech alignment
     band = max(25, int(max(tb, ta) * 0.35))
 
     for i in range(1, tb + 1):
@@ -50,18 +49,16 @@ def dtw_align_mel_a_to_b(mel_a: torch.Tensor, mel_b: torch.Tensor) -> torch.Tens
         for j in range(j_start, j_end):
             d_curr[j] = c_row[j - 1] + min(d_prev[j - 1], d_prev[j], d_curr[j - 1])
 
-    # Backtrack optimal warping path; for each frame i in B, collect aligned frame(s) j in A
     i, j = tb, ta
-    # If band missed (tb, ta), start from minimum cost in last row
     if not np.isfinite(D[tb, ta]):
         j = int(np.argmin(D[tb, 1:])) + 1
 
-    b_to_a_sum = np.zeros((a_np.shape[0], tb), dtype=np.float32)
-    b_to_a_cnt = np.zeros((1, tb), dtype=np.float32)
+    idx_sum = np.zeros(tb, dtype=np.float32)
+    idx_cnt = np.zeros(tb, dtype=np.float32)
 
     while i > 0 and j > 0:
-        b_to_a_sum[:, i - 1] += a_np[:, j - 1]
-        b_to_a_cnt[0, i - 1] += 1.0
+        idx_sum[i - 1] += float(j - 1)
+        idx_cnt[i - 1] += 1.0
         if i == 1 and j == 1:
             break
         diag = D[i - 1, j - 1]
@@ -75,9 +72,18 @@ def dtw_align_mel_a_to_b(mel_a: torch.Tensor, mel_b: torch.Tensor) -> torch.Tens
         else:
             j -= 1
 
-    b_to_a_cnt = np.maximum(b_to_a_cnt, 1.0)
-    warped_a = b_to_a_sum / b_to_a_cnt
-    return torch.from_numpy(warped_a).unsqueeze(0).to(dtype=mel_a.dtype)
+    tau = idx_sum / np.maximum(idx_cnt, 1.0)
+    # Smooth discrete DTW staircase into a continuous differentiable time-warping curve
+    if tb > 5:
+        tau = gaussian_filter1d(tau, sigma=1.2, mode="nearest")
+    tau = np.clip(tau, 0.0, float(ta - 1))
+
+    # Sub-frame linear interpolation along time axis
+    t0 = np.floor(tau).astype(np.int64)
+    t1 = np.minimum(t0 + 1, ta - 1)
+    alpha = (tau - t0.astype(np.float32))[np.newaxis, :]  # (1, T_b)
+    warped_a = (1.0 - alpha) * a_np[:, t0] + alpha * a_np[:, t1]
+    return torch.from_numpy(warped_a.astype(np.float32)).unsqueeze(0).to(dtype=mel_a.dtype)
 
 
 class SpeakerMelDataset(Dataset):
@@ -135,7 +141,7 @@ class SpeakerMelDataset(Dataset):
 
 
 class PairedSpeakerDataset(Dataset):
-    """Pairs parallel utterances (x_A, x_B) with DTW time-alignment and synchronized crops."""
+    """Pairs parallel utterances (x_A, x_B) with Smooth Interpolated DTW alignment."""
 
     def __init__(
         self,
@@ -185,7 +191,6 @@ class PairedSpeakerDataset(Dataset):
             return torch.cat([mel_a_aligned, pad_a], dim=-1), torch.cat([mel_b, pad_b], dim=-1)
         if t == target_frames:
             return mel_a_aligned, mel_b
-        # Synchronized crop window [start : start + target_frames] on both DTW-aligned spectrograms
         if self.random_crop:
             start = int(torch.randint(0, t - target_frames + 1, (1,)).item())
         else:
@@ -197,8 +202,6 @@ class PairedSpeakerDataset(Dataset):
 
 
 class SyntheticSpeakerDataset(Dataset):
-    """Synthetic speaker dataset for fast unit testing."""
-
     def __init__(
         self,
         num_samples: int = 200,

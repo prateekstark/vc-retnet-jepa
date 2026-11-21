@@ -1,13 +1,16 @@
-"""Evaluate Voice Conversion metrics and synthesize WAV samples via 16kHz HiFi-GAN."""
+"""Evaluate Voice Conversion metrics (MCD in dB, SECS, Mel L1, Latent Sim, P_A Loss) & synthesize HiFi-GAN WAVs."""
 
 import argparse
+import math
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.fftpack import dct
 from torch.utils.data import DataLoader
 
-from src.audio.mel_vocoder import LogMelFrontend, load_wav, save_wav
+from src.audio.mel_vocoder import MEL_MEAN, MEL_STD, LogMelFrontend, load_wav, save_wav
 from src.data.vc_dataset import (
     PairedSpeakerDataset,
     SpeakerMelDataset,
@@ -16,6 +19,22 @@ from src.data.vc_dataset import (
 )
 from src.models.latent_converter import VoiceLatentConverter
 from src.utils import build_hybrid_model, get_device, load_config, set_seed
+
+
+def compute_mcd_db(norm_mel_pred: torch.Tensor, norm_mel_target: torch.Tensor) -> float:
+    """Compute official Mel-Cepstral Distortion (MCD in dB) over c1..c13."""
+    # Convert normalized log-mel back to natural log-mel
+    p_np = (norm_mel_pred.squeeze(1).cpu().numpy() * MEL_STD) + MEL_MEAN  # (B, 80, T)
+    t_np = (norm_mel_target.squeeze(1).cpu().numpy() * MEL_STD) + MEL_MEAN
+
+    # Extract MFCCs c1..c13 via orthonormal Type-II DCT along frequency axis
+    mfcc_p = dct(p_np, type=2, axis=1, norm="ortho")[:, 1:14, :]
+    mfcc_t = dct(t_np, type=2, axis=1, norm="ortho")[:, 1:14, :]
+
+    diff_sq = (mfcc_p - mfcc_t) ** 2
+    frame_dist = np.sqrt(np.sum(diff_sq, axis=1))  # (B, T)
+    scale = (10.0 * math.sqrt(2.0)) / math.log(10.0)
+    return float(scale * np.mean(frame_dist))
 
 
 @torch.no_grad()
@@ -43,7 +62,7 @@ def main() -> None:
     model_a = build_hybrid_model(cfg, retnet_mode=retnet_mode)
     model_b = build_hybrid_model(cfg, retnet_mode=retnet_mode)
     converter = VoiceLatentConverter(model_a=model_a, model_b=model_b, mode=mode)
-    converter.load_state_dict(ckpt["converter"])
+    converter.load_state_dict(ckpt["converter"], strict=False)
     converter.to(device).eval()
 
     frontend = LogMelFrontend(
@@ -75,27 +94,36 @@ def main() -> None:
 
     loader = DataLoader(ds_eval, batch_size=16, shuffle=False)
     raw_mel_l1, conv_mel_l1 = 0.0, 0.0
+    raw_mcd, conv_mcd = 0.0, 0.0
     raw_cos, conv_cos = 0.0, 0.0
+    raw_secs, conv_secs = 0.0, 0.0
     jepa_err = 0.0
     n_batches = 0
 
     for spec_a, spec_b in loader:
         spec_a, spec_b = spec_a.to(device).float(), spec_b.to(device).float()
         spec_b2a, z_hat_a = converter.convert_b_to_a(spec_b, ref_spec_a=spec_a)
-        z_a_gt, _ = converter.model_a.encoder(spec_a)
-        z_a_on_b, _ = converter.model_a.encoder(spec_b)
+        z_a_gt, style_a_gt = converter.model_a.encoder(spec_a)
+        z_a_on_b, style_a_on_b = converter.model_a.encoder(spec_b)
+        _, style_b2a = converter.model_a.encoder(spec_b2a)
 
         raw_mel_l1 += F.l1_loss(spec_b, spec_a).item()
         conv_mel_l1 += F.l1_loss(spec_b2a, spec_a).item()
+        raw_mcd += compute_mcd_db(spec_b, spec_a)
+        conv_mcd += compute_mcd_db(spec_b2a, spec_a)
         raw_cos += F.cosine_similarity(z_a_on_b, z_a_gt, dim=-1).mean().item()
         conv_cos += F.cosine_similarity(z_hat_a, z_a_gt, dim=-1).mean().item()
+        raw_secs += F.cosine_similarity(style_a_on_b, style_a_gt, dim=-1).mean().item()
+        conv_secs += F.cosine_similarity(style_b2a, style_a_gt, dim=-1).mean().item()
         jepa_err += converter.model_a.jepa_manifold_verify_loss(z_hat_a).item()
         n_batches += 1
 
     n_batches = max(1, n_batches)
     print(f"=== Voice Conversion Eval (mode={mode}, retnet_mode={retnet_mode}) ===")
+    print(f"MCD (dB, lower is better)     | Unconverted: {raw_mcd/n_batches:.2f} dB -> Converted: {conv_mcd/n_batches:.2f} dB")
     print(f"Mel L1 Distance to Target A   | Unconverted: {raw_mel_l1/n_batches:.4f} -> Converted: {conv_mel_l1/n_batches:.4f}")
     print(f"Latent Cosine Sim to Target A | Unconverted: {raw_cos/n_batches:.4f} -> Converted: {conv_cos/n_batches:.4f}")
+    print(f"Speaker Style Sim (SECS)      | Unconverted: {raw_secs/n_batches:.4f} -> Converted: {conv_secs/n_batches:.4f}")
     print(f"Target P_A JEPA Manifold Loss | {jepa_err/n_batches:.4f}")
 
     out_dir = Path(args.out_dir)
@@ -113,7 +141,6 @@ def main() -> None:
         save_wav(out_dir / f"sample_{i}_target_a_hifigan_gt.wav", wav_a_voc, a_cfg["sample_rate"])
         save_wav(out_dir / f"sample_{i}_converted_b_to_a.wav", wav_b2a, a_cfg["sample_rate"])
 
-        # Also copy the raw original ground-truth WAV recording if evaluating on real data
         if isinstance(ds_eval, PairedSpeakerDataset):
             ia, ib, _ = ds_eval.pairs[i]
             raw_a = load_wav(ds_a.wavs[ia], target_sr=a_cfg["sample_rate"])
