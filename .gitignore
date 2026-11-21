@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+/checkpoints*/
+/outputs*/
+/data/
+*.pt
+*.ckpt
+*.wav
+*.zip
+*.tar.bz2
+vc_results*.txt
+.DS_Store

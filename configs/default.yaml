@@ -1,0 +1,51 @@
+# Scaled-up Configuration for 4 GB VRAM + 16kHz Universal HiFi-GAN Neural Vocoder
+seed: 42
+device: "cuda"
+
+audio:
+  sample_rate: 16000
+  n_fft: 1024           # Matches speechbrain/tts-hifigan-libritts-16kHz
+  win_length: 1024
+  hop_length: 256       # 8 * 8 * 2 * 2 = 256 upsample factor for HiFi-GAN
+  n_mels: 80
+  f_min: 0.0
+  f_max: 8000.0
+  crop_frames: 128      # 128 * 256 / 16000 = 2.048s speech chunks -> 80 x 128
+  hifigan_ckpt: "data/hifigan_16k_generator.ckpt"
+
+model:
+  retnet_mode: "bidirectional"  # "bidirectional" or "causal"
+  patch_size: [8, 8]            # Fine 8-mel frequency patches + Conv2D Post-Net -> 160 tokens (4x faster & fits 4GB VRAM)
+  d_model: 256                  # Scaled up for 4GB VRAM
+  num_layers: 6                 # Deeper encoder
+  decoder_layers: 4             # Deeper decoder + 5-layer Conv2D Post-Net
+  num_heads: 8
+  ffn_mult: 3
+  style_dim: 128
+  postnet_channels: 128         # 5-layer Conv2D harmonic smoothing post-net
+  dropout: 0.1
+  predictor_layers: 3
+  predictor_dim: 192
+
+pretrain:
+  epochs: 50
+  batch_size: 16
+  lr: 3.0e-4
+  weight_decay: 0.03
+  ema_decay: 0.996
+  mask_ratio: 0.45
+  lambda_recon: 1.0
+  lambda_jepa: 0.5
+  lambda_var: 0.05
+
+convert:
+  mode: "hybrid_ac"             # "unpaired", "paired", or "hybrid_ac"
+  epochs: 40
+  batch_size: 8
+  lr: 3.0e-4
+  paired_fraction: 1.0
+  lambda_latent: 1.0
+  lambda_cross_decode: 1.5
+  lambda_jepa_verify: 0.4
+  lambda_cycle: 1.0
+  lambda_content_sim: 0.5
