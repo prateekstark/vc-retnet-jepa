@@ -4,7 +4,6 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${DATA_DIR:-${REPO_DIR}/data}"
 
-# If Google Drive is mounted in Colab (/content/drive/MyDrive), save checkpoints & outputs directly to Drive
 if [ -d "/content/drive/MyDrive" ]; then
     DRIVE_SAVE_DIR="${DRIVE_SAVE_DIR:-/content/drive/MyDrive/vc-retnet-jepa-runs}"
     mkdir -p "${DRIVE_SAVE_DIR}"
@@ -46,14 +45,15 @@ for spk in bdl clb slt; do
     fi
 done
 
-echo "=== [1/5] Pretraining Scaled-Up Hybrid RetNet AE+JEPA (RMSNorm + SiLU + ConvPostNet) ==="
+echo "=== [1/5] Pretraining Upgrade #1 Information-Bottleneck Hybrid RetNet AE+JEPA ==="
 $PY train_hybrid.py --speaker a --wav-dir "${WAV_A}" --epochs "${EPOCHS_PRETRAIN}" --out "${CKPT_DIR}/hybrid_a_bdl.pt"
 $PY train_hybrid.py --speaker b --wav-dir "${WAV_B}" --epochs "${EPOCHS_PRETRAIN}" --out "${CKPT_DIR}/hybrid_b_clb.pt"
 
-echo "=== [2/5] Training B -> A Latent Converters (Unpaired, Paired, Hybrid AC) ==="
+echo "=== [2/5] Training B -> A Latent Converters (Unpaired, Paired, Hybrid AC 100%, Few-Shot Hybrid AC 10%) ==="
 $PY train_converter.py --ckpt-a "${CKPT_DIR}/hybrid_a_bdl.pt" --ckpt-b "${CKPT_DIR}/hybrid_b_clb.pt" --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --mode unpaired  --epochs "${EPOCHS_CONVERT}" --out "${CKPT_DIR}/conv_unpaired.pt"
 $PY train_converter.py --ckpt-a "${CKPT_DIR}/hybrid_a_bdl.pt" --ckpt-b "${CKPT_DIR}/hybrid_b_clb.pt" --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --mode paired    --epochs "${EPOCHS_CONVERT}" --out "${CKPT_DIR}/conv_paired.pt"
 $PY train_converter.py --ckpt-a "${CKPT_DIR}/hybrid_a_bdl.pt" --ckpt-b "${CKPT_DIR}/hybrid_b_clb.pt" --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --mode hybrid_ac --epochs "${EPOCHS_CONVERT}" --out "${CKPT_DIR}/conv_hybrid_ac.pt"
+$PY train_converter.py --ckpt-a "${CKPT_DIR}/hybrid_a_bdl.pt" --ckpt-b "${CKPT_DIR}/hybrid_b_clb.pt" --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --mode hybrid_ac --paired-fraction 0.10 --epochs "${EPOCHS_CONVERT}" --out "${CKPT_DIR}/conv_hybrid_ac_10pct.pt"
 
 echo "=== [3/5] Running Paper Ablations (1: No P_A Verification, 2: Pure AE without JEPA) ==="
 $PY train_converter.py --ckpt-a "${CKPT_DIR}/hybrid_a_bdl.pt" --ckpt-b "${CKPT_DIR}/hybrid_b_clb.pt" --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --mode unpaired --lambda-jepa-verify 0.0 --epochs "${EPOCHS_CONVERT}" --out "${CKPT_DIR}/conv_unpaired_no_pa.pt"
@@ -66,20 +66,22 @@ echo "=== [4/5] Second Speaker Pair (slt -> bdl) ==="
 $PY train_hybrid.py --speaker b --wav-dir "${WAV_C}" --epochs "${EPOCHS_PRETRAIN}" --out "${CKPT_DIR}/hybrid_c_slt.pt"
 $PY train_converter.py --ckpt-a "${CKPT_DIR}/hybrid_a_bdl.pt" --ckpt-b "${CKPT_DIR}/hybrid_c_slt.pt" --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_C}" --mode hybrid_ac --epochs "${EPOCHS_CONVERT}" --out "${CKPT_DIR}/conv_slt2bdl_ac.pt"
 
-echo "=== [5/5] Evaluating All Models & Synthesizing HiFi-GAN Audio (.wav) ==="
+echo "=== [5/5] Evaluating All 7 Models & Synthesizing HiFi-GAN Audio (.wav) ==="
 {
-    echo "--- 1. Unpaired Cycle + P_A Verification (clb -> bdl) ---"
-    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_unpaired.pt"       --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_unpaired"
-    echo "--- 2. Ablation: Unpaired Cycle WITHOUT P_A Verification (clb -> bdl) ---"
-    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_unpaired_no_pa.pt" --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_unpaired_no_pa"
-    echo "--- 3. Paired Cross-Decode + P_A Verification (clb -> bdl) ---"
-    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_paired.pt"         --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_paired"
-    echo "--- 4. Hybrid AC (Cycle + Paired + P_A Verification, clb -> bdl) ---"
-    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_hybrid_ac.pt"      --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_hybrid_ac"
-    echo "--- 5. Ablation: Pure AE (lambda_jepa=0, clb -> bdl) ---"
-    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_pure_ae.pt"        --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_pure_ae"
-    echo "--- 6. Second Speaker Pair: Hybrid AC (slt -> bdl) ---"
-    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_slt2bdl_ac.pt"     --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_C}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_slt2bdl_ac"
+    echo "--- 1. Unpaired Cycle + Bottleneck Anchor + P_A Verification (clb -> bdl, 0 pairs) ---"
+    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_unpaired.pt"          --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_unpaired"
+    echo "--- 2. Ablation: Unpaired Cycle WITHOUT P_A Verification (clb -> bdl, 0 pairs) ---"
+    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_unpaired_no_pa.pt"    --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_unpaired_no_pa"
+    echo "--- 3. Smooth-DTW Paired Cross-Decode + P_A Verification (clb -> bdl, 100% pairs) ---"
+    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_paired.pt"            --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_paired"
+    echo "--- 4. Proposed Hybrid AC (Full 100% Pairs, clb -> bdl) ---"
+    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_hybrid_ac.pt"         --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_hybrid_ac"
+    echo "--- 5. Few-Shot Hybrid AC (Only 10% Pairs = 103 utterances, clb -> bdl) ---"
+    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_hybrid_ac_10pct.pt"   --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_hybrid_ac_10pct"
+    echo "--- 6. Ablation: Pure AE (lambda_jepa=0, clb -> bdl) ---"
+    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_pure_ae.pt"           --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_B}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_pure_ae"
+    echo "--- 7. Second Speaker Pair: Hybrid AC (slt -> bdl) ---"
+    $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_slt2bdl_ac.pt"        --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_C}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_slt2bdl_ac"
 } | tee "${REPO_DIR}/vc_results_v2.txt"
 
 if [ "${RESULTS_FILE}" != "${REPO_DIR}/vc_results_v2.txt" ]; then

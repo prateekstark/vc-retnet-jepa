@@ -1,4 +1,4 @@
-"""Scaled-up B -> A Latent Space Converter with Soft Cross-Context Attention & Trainable Conv2D Post-Net Refinement."""
+"""Scaled-up B -> A Latent Space Converter with Bottleneck Anchor, Few-Shot Masking, & Post-Net Refinement."""
 
 import copy
 from typing import Dict, Optional, Tuple
@@ -26,7 +26,6 @@ class RetNetLatentTranslator(nn.Module):
         self.blocks = nn.ModuleList(
             [RetNetBlock(d_model, num_heads, ffn_mult=3, mode=mode, dropout=dropout) for _ in range(num_layers)]
         )
-        # Upgrade 3b: Soft temporal-frequency context attention layer for sub-patch alignment
         self.attn_norm = nn.RMSNorm(d_model)
         self.context_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         self.norm = nn.RMSNorm(d_model)
@@ -108,7 +107,6 @@ def spectral_contrast_loss(spec_pred: torch.Tensor, spec_real: torch.Tensor) -> 
 
 
 def harmonic_gradient_loss(spec_pred: torch.Tensor, spec_target: torch.Tensor) -> torch.Tensor:
-    """2D spectral derivative loss to sharpen fine F0 harmonic lines and consonant transients."""
     df_p = spec_pred[:, :, 1:, :] - spec_pred[:, :, :-1, :]
     df_t = spec_target[:, :, 1:, :] - spec_target[:, :, :-1, :]
     dt_p = spec_pred[:, :, :, 1:] - spec_pred[:, :, :, :-1]
@@ -117,7 +115,7 @@ def harmonic_gradient_loss(spec_pred: torch.Tensor, spec_target: torch.Tensor) -
 
 
 class VoiceLatentConverter(nn.Module):
-    """Converts Domain/Speaker B latents onto Domain/Speaker A with trainable Post-Net refinement."""
+    """Converts Domain/Speaker B latents onto Domain/Speaker A."""
 
     def __init__(
         self,
@@ -158,10 +156,13 @@ class VoiceLatentConverter(nn.Module):
         self.t_b2a = RetNetLatentTranslator(d_model, num_heads, num_layers=3, mode=ret_mode)
         self.t_a2b = RetNetLatentTranslator(d_model, num_heads, num_layers=3, mode=ret_mode)
 
-        # Upgrade 2: Trainable Conv2D Post-Net copy initialized from D_A's postnet to sharpen translated harmonics
+        # Keep postnet_refine frozen in purely unpaired mode so it never drifts without a spectrogram target
         self.postnet_refine = copy.deepcopy(self.model_a.decoder.postnet)
+        train_postnet = mode in ("paired", "hybrid_ac")
         for p in self.postnet_refine.parameters():
-            p.requires_grad = True
+            p.requires_grad = train_postnet
+        if not train_postnet:
+            self.postnet_refine.eval()
 
     def decode_refined_a(
         self, z_hat_a: torch.Tensor, style_a: Optional[torch.Tensor] = None
@@ -190,6 +191,7 @@ class VoiceLatentConverter(nn.Module):
         za_u: torch.Tensor,
         style_a_u: torch.Tensor,
         zb_u: torch.Tensor,
+        za_on_b_u: Optional[torch.Tensor] = None,
         pair_a: Optional[torch.Tensor] = None,
         za_p: Optional[torch.Tensor] = None,
         style_a_p: Optional[torch.Tensor] = None,
@@ -215,27 +217,24 @@ class VoiceLatentConverter(nn.Module):
         total = total + self.lambda_content_sim * content_loss
         metrics["content_sim"] = content_loss.item()
 
-        dec_style = style_a_p if (self.mode in ("paired", "hybrid_ac") and style_a_p is not None) else style_a_u
-        y_pre, y_post = self.decode_refined_a(z_hat_a, dec_style)
-
         if self.mode in ("unpaired", "hybrid_ac"):
             z_b_cyc = self.t_a2b(z_hat_a)
             z_hat_b = self.t_a2b(za_u)
             z_a_cyc = self.t_b2a(z_hat_b)
+            cycle_loss = latent_match_loss(z_b_cyc, zb_u) + latent_match_loss(z_a_cyc, za_u)
 
-            contrast_loss = spectral_contrast_loss(y_post, unpaired_a)
-            cycle_loss = (
-                latent_match_loss(z_b_cyc, zb_u)
-                + latent_match_loss(z_a_cyc, za_u)
-                + 0.5 * contrast_loss
-            )
+            # In pure unpaired mode, anchor coordinate basis via InstanceNorm-bottlenecked E_A(x_B)
+            if self.mode == "unpaired" and za_on_b_u is not None:
+                anchor_loss = latent_match_loss(z_hat_a, za_on_b_u)
+                cycle_loss = cycle_loss + 0.6 * anchor_loss
+
             total = total + self.lambda_cycle * cycle_loss
             metrics["cycle"] = cycle_loss.item()
 
-        if self.mode in ("paired", "hybrid_ac"):
-            if pair_a is None or za_p is None or style_a_p is None or zb_p is None:
-                raise ValueError(f"Mode '{self.mode}' requires paired tensors.")
-            lat_loss = latent_match_loss(z_hat_a, za_p)
+        if self.mode in ("paired", "hybrid_ac") and pair_a is not None and pair_a.shape[0] > 0:
+            z_hat_a_p = self.t_b2a(zb_p) if (zb_p is not zb_u) else z_hat_a
+            y_pre, y_post = self.decode_refined_a(z_hat_a_p, style_a_p)
+            lat_loss = latent_match_loss(z_hat_a_p, za_p)
             grad_loss = harmonic_gradient_loss(y_post, pair_a)
             cross_dec_loss = (
                 0.5 * (F.l1_loss(y_pre, pair_a) + 0.5 * F.mse_loss(y_pre, pair_a))

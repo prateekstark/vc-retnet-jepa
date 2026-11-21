@@ -1,6 +1,7 @@
 """Train Scaled-up Hybrid Split-Latent RetNet Encoder + Conv-PostNet Decoder + JEPA (with Auto-AMP & compile on T4+)."""
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
@@ -89,7 +90,7 @@ def main() -> None:
     for epoch in range(start_epoch, epochs + 1):
         raw_model.train()
         running = {}
-        for specs in tqdm(loader, desc=f"Epoch {epoch}/{epochs}", leave=False):
+        for specs in tqdm(loader, desc=f"Epoch {epoch}/{epochs}", leave=False, disable=not sys.stdout.isatty()):
             specs = specs.to(device).float()
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
@@ -106,13 +107,13 @@ def main() -> None:
         n_steps = max(1, len(loader))
         if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
             summary = " | ".join(f"{k}={v/n_steps:.4f}" for k, v in running.items())
-            print(f"Epoch {epoch:03d}/{epochs} | {summary}")
+            print(f"Epoch {epoch:03d}/{epochs} | {summary}", flush=True)
             torch.save(
                 {"model": raw_model.state_dict(), "retnet_mode": raw_model.encoder.mode, "epoch": epoch},
                 out_path,
             )
 
-    print(f"Saved hybrid checkpoint to {out_path}")
+    print(f"Saved hybrid checkpoint to {out_path}", flush=True)
 
 
 if __name__ == "__main__":

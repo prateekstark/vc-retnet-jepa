@@ -1,7 +1,8 @@
-"""Train Scaled-up B -> A Latent Space Converter with Pre-Cached DTW & Frozen Encoder Latents."""
+"""Train Scaled-up B -> A Latent Space Converter with Pre-Cached DTW, Bottleneck Anchor, & Few-Shot Pairing."""
 
 import argparse
 import sys
+from itertools import cycle
 from pathlib import Path
 from typing import Dict
 
@@ -27,24 +28,28 @@ def get_or_build_latent_cache(
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     if cache_path.exists():
-        print(f"Loading precomputed DTW + frozen encoder latents from {cache_path}")
-        return torch.load(cache_path, map_location="cpu", weights_only=True)
+        data = torch.load(cache_path, map_location="cpu", weights_only=True)
+        if "za_on_b" in data:
+            print(f"Loading precomputed DTW + frozen encoder latents from {cache_path}", flush=True)
+            return data
 
-    print(f"Precomputing DTW alignment & frozen (E_A, E_B) latents for {len(ds_pair)} pairs -> {cache_path} ...")
+    print(f"Precomputing DTW alignment & frozen (E_A, E_B) latents for {len(ds_pair)} pairs -> {cache_path} ...", flush=True)
     loader = DataLoader(ds_pair, batch_size=32, shuffle=False)
     spec_a_list, spec_b_list = [], []
-    za_list, style_a_list, zb_list = [], [], []
+    za_list, style_a_list, zb_list, za_on_b_list = [], [], [], []
 
     for b_idx, (sa, sb) in enumerate(tqdm(loader, desc="DTW + Frozen Encoder Cache", leave=False, disable=not sys.stdout.isatty())):
         sa_d = sa.to(device).float()
         sb_d = sb.to(device).float()
         za, style_a = converter.model_a.encoder(sa_d)
         zb, _ = converter.model_b.encoder(sb_d)
+        za_on_b, _ = converter.model_a.encoder(sb_d)
         spec_a_list.append(sa_d.cpu())
         spec_b_list.append(sb_d.cpu())
         za_list.append(za.cpu())
         style_a_list.append(style_a.cpu())
         zb_list.append(zb.cpu())
+        za_on_b_list.append(za_on_b.cpu())
         if (b_idx + 1) % 10 == 0:
             print(f"  Cached {(b_idx + 1) * 32}/{len(ds_pair)} pairs...", flush=True)
 
@@ -54,6 +59,7 @@ def get_or_build_latent_cache(
         "za": torch.cat(za_list, dim=0),
         "style_a": torch.cat(style_a_list, dim=0),
         "zb": torch.cat(zb_list, dim=0),
+        "za_on_b": torch.cat(za_on_b_list, dim=0),
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(data, cache_path)
@@ -85,6 +91,7 @@ def main() -> None:
 
     mode = args.mode or c_cfg["mode"]
     epochs = args.epochs or c_cfg["epochs"]
+    paired_frac = args.paired_fraction if args.paired_fraction is not None else c_cfg["paired_fraction"]
     l_jepa_ver = args.lambda_jepa_verify if args.lambda_jepa_verify is not None else c_cfg["lambda_jepa_verify"]
 
     ckpt_a = torch.load(args.ckpt_a, map_location="cpu", weights_only=True)
@@ -132,11 +139,24 @@ def main() -> None:
         ds_pair = SyntheticPairedSpeakerDataset(ds_a, ds_b)
         cache_key = "synthetic"
 
-    cache_path = Path(args.out).parent / f".latent_cache_{cache_key}.pt"
+    cache_path = Path(args.out).parent / f".latent_cache_v5_{cache_key}.pt"
     cached = get_or_build_latent_cache(converter, ds_pair, cache_path, device)
 
-    tensor_ds = TensorDataset(cached["spec_a"], cached["za"], cached["style_a"], cached["zb"])
-    loader = DataLoader(tensor_ds, batch_size=bs, shuffle=True, drop_last=True)
+    n_total = cached["spec_a"].shape[0]
+    n_paired = max(bs, int(round(n_total * paired_frac)))
+
+    unpaired_ds = TensorDataset(
+        cached["spec_a"], cached["za"], cached["style_a"], cached["zb"], cached["za_on_b"]
+    )
+    unpaired_loader = DataLoader(unpaired_ds, batch_size=bs, shuffle=True, drop_last=True)
+
+    paired_ds = TensorDataset(
+        cached["spec_a"][:n_paired],
+        cached["za"][:n_paired],
+        cached["style_a"][:n_paired],
+        cached["zb"][:n_paired],
+    )
+    paired_loader = DataLoader(paired_ds, batch_size=bs, shuffle=True, drop_last=True)
 
     trainable = [p for p in converter.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=c_cfg["lr"], weight_decay=0.02)
@@ -144,27 +164,42 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(
-        f"[Converter mode={mode}] retnet_mode={retnet_mode} | lambda_jepa_verify={l_jepa_ver} | "
-        f"bs={bs} | trainable_params={sum(p.numel() for p in trainable):,} | device={device}"
+        f"[Converter mode={mode}] retnet_mode={retnet_mode} | paired_frac={paired_frac} ({n_paired}/{n_total} pairs) | "
+        f"lambda_jepa_verify={l_jepa_ver} | bs={bs} | trainable_params={sum(p.numel() for p in trainable):,} | device={device}",
+        flush=True,
     )
 
     for epoch in range(1, epochs + 1):
         converter.train()
         converter.model_a.eval()
         converter.model_b.eval()
+        if mode == "unpaired":
+            converter.postnet_refine.eval()
         running = {}
+        pair_iter = cycle(paired_loader) if mode in ("paired", "hybrid_ac") else None
 
-        for sa_p, za_p, style_a_p, zb_p in tqdm(loader, desc=f"Convert {epoch}/{epochs}", leave=False):
-            sa_p = sa_p.to(device).float()
-            za_p = za_p.to(device).float()
-            style_a_p = style_a_p.to(device).float()
-            zb_p = zb_p.to(device).float()
+        for sa_r, za_r, style_a_r, zb_u, za_on_b_u in tqdm(
+            unpaired_loader, desc=f"Convert {epoch}/{epochs}", leave=False, disable=not sys.stdout.isatty()
+        ):
+            sa_u = sa_r.roll(shifts=1, dims=0).to(device).float()
+            za_u = za_r.roll(shifts=1, dims=0).to(device).float()
+            style_a_u = style_a_r.roll(shifts=1, dims=0).to(device).float()
+            zb_u = zb_u.to(device).float()
+            za_on_b_u = za_on_b_u.to(device).float()
 
-            # For unpaired terms, roll batch index by 1 so (A, B) are unpaired utterances
-            sa_u = sa_p.roll(shifts=1, dims=0)
-            za_u = za_p.roll(shifts=1, dims=0)
-            style_a_u = style_a_p.roll(shifts=1, dims=0)
-            zb_u = zb_p
+            sa_p, za_p, style_a_p, zb_p = None, None, None, None
+            if pair_iter is not None:
+                if paired_frac >= 1.0:
+                    sa_p = sa_r.to(device).float()
+                    za_p = za_r.to(device).float()
+                    style_a_p = style_a_r.to(device).float()
+                    zb_p = zb_u
+                else:
+                    sap, zap, stap, zbp = next(pair_iter)
+                    sa_p = sap.to(device).float()
+                    za_p = zap.to(device).float()
+                    style_a_p = stap.to(device).float()
+                    zb_p = zbp.to(device).float()
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
@@ -173,10 +208,11 @@ def main() -> None:
                     za_u=za_u,
                     style_a_u=style_a_u,
                     zb_u=zb_u,
-                    pair_a=sa_p if mode in ("paired", "hybrid_ac") else None,
-                    za_p=za_p if mode in ("paired", "hybrid_ac") else None,
-                    style_a_p=style_a_p if mode in ("paired", "hybrid_ac") else None,
-                    zb_p=zb_p if mode in ("paired", "hybrid_ac") else None,
+                    za_on_b_u=za_on_b_u,
+                    pair_a=sa_p,
+                    za_p=za_p,
+                    style_a_p=style_a_p,
+                    zb_p=zb_p,
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -187,16 +223,16 @@ def main() -> None:
             for k, v in stats.items():
                 running[k] = running.get(k, 0.0) + v
 
-        n_steps = max(1, len(loader))
+        n_steps = max(1, len(unpaired_loader))
         if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
             summary = " | ".join(f"{k}={v/n_steps:.4f}" for k, v in running.items())
-            print(f"Epoch {epoch:03d}/{epochs} | {summary}")
+            print(f"Epoch {epoch:03d}/{epochs} | {summary}", flush=True)
             torch.save(
                 {"converter": converter.state_dict(), "mode": mode, "retnet_mode": retnet_mode, "epoch": epoch},
                 out_path,
             )
 
-    print(f"Saved converter checkpoint to {out_path}")
+    print(f"Saved converter checkpoint to {out_path}", flush=True)
 
 
 if __name__ == "__main__":

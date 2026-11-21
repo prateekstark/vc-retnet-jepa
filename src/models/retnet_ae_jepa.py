@@ -1,4 +1,4 @@
-"""Scaled-up Hybrid Split-Latent RetNet Encoder + Conv-PostNet Decoder + JEPA."""
+"""Scaled-up Hybrid Split-Latent RetNet Encoder (with 32-D InstanceNorm Information Bottleneck) + Conv-PostNet Decoder + JEPA."""
 
 import copy
 from typing import Dict, Optional, Tuple
@@ -17,7 +17,6 @@ def compute_retention_decay(
     gammas: torch.Tensor,
     causal: bool,
 ) -> torch.Tensor:
-    # Use first batch element when positions are shared across batch -> 16x less memory & compute
     pos0 = positions[0:1]
     diff = pos0.unsqueeze(2) - pos0.unsqueeze(1)
     if causal:
@@ -115,18 +114,19 @@ class RetNetBlock(nn.Module):
 
 
 class SplitLatentRetNetEncoder(nn.Module):
-    """Encoder outputting semantic tokens z_sem and intermediate timbre/style vector z_style."""
+    """Encoder with 32-D InstanceNorm Information Bottleneck on z_sem + intermediate style z_style."""
 
     def __init__(
         self,
         n_mels: int = 80,
         crop_frames: int = 128,
-        patch_size: Tuple[int, int] = (8, 4),
+        patch_size: Tuple[int, int] = (8, 8),
         d_model: int = 256,
         num_layers: int = 6,
         num_heads: int = 8,
         ffn_mult: int = 3,
         style_dim: int = 128,
+        bottleneck_dim: int = 32,
         mode: str = "bidirectional",
         dropout: float = 0.1,
     ) -> None:
@@ -149,6 +149,11 @@ class SplitLatentRetNetEncoder(nn.Module):
         self.blocks = nn.ModuleList(
             [RetNetBlock(d_model, num_heads, ffn_mult, mode=mode, dropout=dropout) for _ in range(num_layers)]
         )
+        self.norm_pre_bn = nn.RMSNorm(d_model)
+        # Upgrade 1: Tight 32-D Information Bottleneck + InstanceNorm1d strips global speaker timbre from z_sem
+        self.sem_bottleneck_down = nn.Linear(d_model, bottleneck_dim, bias=False)
+        self.sem_inorm = nn.InstanceNorm1d(bottleneck_dim, affine=False, eps=1e-4)
+        self.sem_bottleneck_up = nn.Linear(bottleneck_dim, d_model, bias=False)
         self.norm_sem = nn.RMSNorm(d_model)
 
         self.style_head = nn.Sequential(
@@ -157,6 +162,13 @@ class SplitLatentRetNetEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(style_dim, style_dim),
         )
+        self.orth_proj = nn.Linear(d_model, style_dim, bias=False)
+
+    def _apply_bottleneck(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm_pre_bn(x)
+        z_bn = self.sem_bottleneck_down(h).transpose(1, 2)  # (B, 32, L)
+        z_bn = self.sem_inorm(z_bn).transpose(1, 2)         # (B, L, 32)
+        return self.norm_sem(self.sem_bottleneck_up(z_bn))
 
     def patchify(self, spec: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(spec)
@@ -170,7 +182,7 @@ class SplitLatentRetNetEncoder(nn.Module):
             x = blk(x)
             if i + 1 == self.split_layer:
                 z_style = self.style_head(x.mean(dim=1))
-        z_sem = self.norm_sem(x)
+        z_sem = self._apply_bottleneck(x)
         return z_sem, z_style
 
     def encode_context(self, spec: torch.Tensor, keep_indices: torch.Tensor) -> torch.Tensor:
@@ -179,7 +191,7 @@ class SplitLatentRetNetEncoder(nn.Module):
         x = torch.gather(tokens, dim=1, index=idx_exp)
         for blk in self.blocks:
             x = blk(x, positions=keep_indices)
-        return self.norm_sem(x)
+        return self._apply_bottleneck(x)
 
 
 class Conv2DPostNet(nn.Module):
@@ -212,7 +224,7 @@ class RetNetSpectrogramDecoder(nn.Module):
         self,
         n_mels: int = 80,
         crop_frames: int = 128,
-        patch_size: Tuple[int, int] = (8, 4),
+        patch_size: Tuple[int, int] = (8, 8),
         d_model: int = 256,
         style_dim: int = 128,
         num_layers: int = 4,
@@ -244,7 +256,6 @@ class RetNetSpectrogramDecoder(nn.Module):
     def forward_both(
         self, z_sem: torch.Tensor, z_style: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (y_pre, y_post) where y_post = y_pre + postnet(y_pre)."""
         b, _, _ = z_sem.shape
         if z_style is None:
             z_style = self.default_style.expand(b, -1)
@@ -363,7 +374,7 @@ def variance_loss(z: torch.Tensor) -> torch.Tensor:
 
 
 class HybridRetNetAEJEPA(nn.Module):
-    """Joint Encoder + Conv-PostNet Decoder + JEPA trained with L_recon + lambda * L_JEPA."""
+    """Joint Bottleneck Encoder + Conv-PostNet Decoder + JEPA with Orthogonal Style Disentanglement."""
 
     def __init__(
         self,
@@ -376,6 +387,7 @@ class HybridRetNetAEJEPA(nn.Module):
         lambda_recon: float = 1.0,
         lambda_jepa: float = 0.5,
         lambda_var: float = 0.05,
+        lambda_orth: float = 0.2,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -395,6 +407,7 @@ class HybridRetNetAEJEPA(nn.Module):
         self.lambda_recon = lambda_recon
         self.lambda_jepa = lambda_jepa
         self.lambda_var = lambda_var
+        self.lambda_orth = lambda_orth
 
     @torch.no_grad()
     def update_ema(self, decay: float = 0.996) -> None:
@@ -425,7 +438,6 @@ class HybridRetNetAEJEPA(nn.Module):
             self.decoder.default_style.data.mul_(0.99).add_(z_style.mean(dim=0, keepdim=True), alpha=0.01)
 
         y_pre, y_post = self.decoder.forward_both(z_sem, z_style)
-        # Supervise both pre-postnet and post-postnet spectrograms (Tacotron2/FastSpeech2 style)
         recon_loss = (
             0.5 * (F.l1_loss(y_pre, spec) + 0.5 * F.mse_loss(y_pre, spec))
             + 1.0 * (F.l1_loss(y_post, spec) + 0.5 * F.mse_loss(y_post, spec))
@@ -454,14 +466,20 @@ class HybridRetNetAEJEPA(nn.Module):
             jepa_loss = torch.tensor(0.0, device=spec.device)
 
         var_loss = variance_loss(z_sem)
+        # Upgrade 1b: Cosine Orthogonality Disentanglement between semantic content and speaker style
+        sem_proj = self.encoder.orth_proj(z_sem.mean(dim=1))
+        orth_loss = F.cosine_similarity(sem_proj, z_style, dim=-1).abs().mean()
+
         total = (
             self.lambda_recon * recon_loss
             + self.lambda_jepa * jepa_loss
             + self.lambda_var * var_loss
+            + self.lambda_orth * orth_loss
         )
         return total, {
             "recon": recon_loss.item(),
             "jepa": jepa_loss.item(),
+            "orth": orth_loss.item(),
             "var": var_loss.item(),
             "total": total.item(),
         }
