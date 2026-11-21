@@ -3,8 +3,20 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${DATA_DIR:-${REPO_DIR}/data}"
-CKPT_DIR="${REPO_DIR}/checkpoints_v2"
-OUT_DIR="${REPO_DIR}/outputs_v2"
+
+# If Google Drive is mounted in Colab (/content/drive/MyDrive), save checkpoints & outputs directly to Drive
+if [ -d "/content/drive/MyDrive" ]; then
+    DRIVE_SAVE_DIR="${DRIVE_SAVE_DIR:-/content/drive/MyDrive/vc-retnet-jepa-runs}"
+    mkdir -p "${DRIVE_SAVE_DIR}"
+    CKPT_DIR="${CKPT_DIR:-${DRIVE_SAVE_DIR}/checkpoints_v2}"
+    OUT_DIR="${OUT_DIR:-${DRIVE_SAVE_DIR}/outputs_v2}"
+    RESULTS_FILE="${DRIVE_SAVE_DIR}/vc_results_v2.txt"
+    echo "[Google Drive detected] Saving checkpoints, WAVs, and results directly to: ${DRIVE_SAVE_DIR}"
+else
+    CKPT_DIR="${CKPT_DIR:-${REPO_DIR}/checkpoints_v2}"
+    OUT_DIR="${OUT_DIR:-${REPO_DIR}/outputs_v2}"
+    RESULTS_FILE="${REPO_DIR}/vc_results_v2.txt"
+fi
 PY="${PYTHON:-$(command -v python3 || command -v python)}"
 
 WAV_A="${DATA_DIR}/cmu_us_bdl_arctic/wav"
@@ -70,4 +82,11 @@ echo "=== [5/5] Evaluating All Models & Synthesizing HiFi-GAN Audio (.wav) ==="
     $PY convert_voice.py --converter-ckpt "${CKPT_DIR}/conv_slt2bdl_ac.pt"     --wav-dir-a "${WAV_A}" --wav-dir-b "${WAV_C}" --hifigan-ckpt "${HIFIGAN_CKPT}" --out-dir "${OUT_DIR}/samples_slt2bdl_ac"
 } | tee "${REPO_DIR}/vc_results_v2.txt"
 
-echo "=== All Experiments Complete! Results in ${REPO_DIR}/vc_results_v2.txt ==="
+if [ "${RESULTS_FILE}" != "${REPO_DIR}/vc_results_v2.txt" ]; then
+    cp -f "${REPO_DIR}/vc_results_v2.txt" "${RESULTS_FILE}"
+fi
+
+echo "=== All Experiments Complete! ==="
+echo "Checkpoints saved in: ${CKPT_DIR}"
+echo "WAV samples saved in: ${OUT_DIR}"
+echo "Metrics saved in:     ${RESULTS_FILE}"
