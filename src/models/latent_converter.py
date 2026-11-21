@@ -152,6 +152,76 @@ class VoiceLatentConverter(nn.Module):
         spec_b2a = self.model_a.decoder(z_hat_a, style_a)
         return spec_b2a, z_hat_a
 
+    def forward_cached_step(
+        self,
+        unpaired_a: torch.Tensor,
+        za_u: torch.Tensor,
+        style_a_u: torch.Tensor,
+        zb_u: torch.Tensor,
+        pair_a: Optional[torch.Tensor] = None,
+        za_p: Optional[torch.Tensor] = None,
+        style_a_p: Optional[torch.Tensor] = None,
+        zb_p: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Fast step using pre-extracted frozen encoder latents (za, style_a, zb) and DTW-aligned pair_a."""
+        total = torch.tensor(0.0, device=zb_u.device)
+        metrics: Dict[str, float] = {}
+
+        z_hat_a = self.t_b2a(zb_u)
+
+        # 1. Frozen P_A Manifold Verification + Deep CORAL + Content Self-Similarity
+        if self.lambda_jepa_verify > 0.0:
+            jepa_ver_a = self.model_a.jepa_manifold_verify_loss(z_hat_a)
+            total = total + self.lambda_jepa_verify * jepa_ver_a
+            metrics["jepa_verify"] = jepa_ver_a.item()
+
+        coral_loss = coral_and_band_moment_loss(
+            z_hat_a, za_u, n_freq_patches=self.model_a.encoder.n_freq_patches
+        )
+        total = total + self.lambda_coral * coral_loss
+        metrics["coral"] = coral_loss.item()
+
+        content_loss = content_self_similarity_loss(zb_u, z_hat_a)
+        total = total + self.lambda_content_sim * content_loss
+        metrics["content_sim"] = content_loss.item()
+
+        # Decode z_hat_a once through D_A and reuse for both cycle/contrast and paired cross-decode
+        dec_style = style_a_p if (self.mode in ("paired", "hybrid_ac") and style_a_p is not None) else style_a_u
+        y_pre, y_post = self.model_a.decoder.forward_both(z_hat_a, dec_style)
+
+        # 2. Unpaired Latent Cycle Consistency (B -> A -> B and A -> B -> A) + Spectral Contrast
+        if self.mode in ("unpaired", "hybrid_ac"):
+            z_b_cyc = self.t_a2b(z_hat_a)
+            z_hat_b = self.t_a2b(za_u)
+            z_a_cyc = self.t_b2a(z_hat_b)
+
+            contrast_loss = spectral_contrast_loss(y_post, unpaired_a)
+            cycle_loss = (
+                latent_match_loss(z_b_cyc, zb_u)
+                + latent_match_loss(z_a_cyc, za_u)
+                + 0.5 * contrast_loss
+            )
+            total = total + self.lambda_cycle * cycle_loss
+            metrics["cycle"] = cycle_loss.item()
+
+        # 3. DTW-Aligned Paired Supervision: T_{B->A}(z_B) -> z_A_dtw and D_A(z_hat_A) -> x_A_dtw
+        if self.mode in ("paired", "hybrid_ac"):
+            if pair_a is None or za_p is None or style_a_p is None or zb_p is None:
+                raise ValueError(f"Mode '{self.mode}' requires paired tensors.")
+            lat_loss = latent_match_loss(z_hat_a, za_p)
+            cross_dec_loss = (
+                0.5 * (F.l1_loss(y_pre, pair_a) + 0.5 * F.mse_loss(y_pre, pair_a))
+                + 1.0 * (F.l1_loss(y_post, pair_a) + 0.5 * F.mse_loss(y_post, pair_a))
+                + 0.4 * spectral_contrast_loss(y_post, pair_a)
+            )
+
+            total = total + self.lambda_latent * lat_loss + self.lambda_cross_decode * cross_dec_loss
+            metrics["latent_pair"] = lat_loss.item()
+            metrics["cross_decode"] = cross_dec_loss.item()
+
+        metrics["total"] = total.item()
+        return total, metrics
+
     def forward_step(
         self,
         unpaired_a: torch.Tensor,
