@@ -57,9 +57,12 @@ def main() -> None:
     raw_model = build_hybrid_model(cfg, retnet_mode=args.retnet_mode, lambda_jepa_override=args.lambda_jepa).to(device)
     trainable = [p for p in raw_model.parameters() if p.requires_grad]
 
-    # Auto-enable FP16 AMP & torch.compile on Volta/Turing/Ampere+ (e.g. Colab T4, capability >= 7.0)
+    # Auto-enable FP16 AMP & larger batch size on Volta/Turing/Ampere+ (e.g. Colab T4, capability >= 7.0)
     cc_major = torch.cuda.get_device_capability(device)[0] if device.type == "cuda" else 0
     use_amp = cc_major >= 7
+    if args.batch_size is None and cc_major >= 7:
+        bs = 32
+        loader = DataLoader(dataset, batch_size=bs, shuffle=True, drop_last=True)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     optimizer = torch.optim.AdamW(trainable, lr=p_cfg["lr"], weight_decay=p_cfg["weight_decay"])
@@ -76,9 +79,6 @@ def main() -> None:
             print(f"Architecture changed for {out_path}; starting fresh from epoch 1.")
 
     model = raw_model
-    if cc_major >= 7 and not args.no_compile and hasattr(torch, "compile"):
-        print("Enabling torch.compile (Inductor/Triton) + FP16 AMP for T4/modern GPU...")
-        model = torch.compile(raw_model)
 
     print(
         f"[Hybrid AE+JEPA Speaker-{args.speaker.upper()}] mode={raw_model.encoder.mode} | "

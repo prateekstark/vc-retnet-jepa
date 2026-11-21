@@ -117,9 +117,6 @@ def main() -> None:
             print(f"Architecture changed for {out_path}; starting fresh from epoch 1.")
 
     step_fn = converter.forward_step
-    if cc_major >= 7 and not args.no_compile and hasattr(torch, "compile"):
-        print("Enabling torch.compile (Inductor/Triton) + FP16 AMP for T4/modern GPU...")
-        step_fn = torch.compile(converter.forward_step)
 
     print(
         f"[Converter mode={mode}] retnet_mode={retnet_mode} | lambda_jepa_verify={l_jepa_ver} | "
