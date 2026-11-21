@@ -1,6 +1,7 @@
 """Train Scaled-up B -> A Latent Space Converter with Pre-Cached DTW & Frozen Encoder Latents."""
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Dict
 
@@ -34,7 +35,7 @@ def get_or_build_latent_cache(
     spec_a_list, spec_b_list = [], []
     za_list, style_a_list, zb_list = [], [], []
 
-    for sa, sb in tqdm(loader, desc="DTW + Frozen Encoder Cache", leave=False):
+    for b_idx, (sa, sb) in enumerate(tqdm(loader, desc="DTW + Frozen Encoder Cache", leave=False, disable=not sys.stdout.isatty())):
         sa_d = sa.to(device).float()
         sb_d = sb.to(device).float()
         za, style_a = converter.model_a.encoder(sa_d)
@@ -44,6 +45,8 @@ def get_or_build_latent_cache(
         za_list.append(za.cpu())
         style_a_list.append(style_a.cpu())
         zb_list.append(zb.cpu())
+        if (b_idx + 1) % 10 == 0:
+            print(f"  Cached {(b_idx + 1) * 32}/{len(ds_pair)} pairs...", flush=True)
 
     data = {
         "spec_a": torch.cat(spec_a_list, dim=0),
