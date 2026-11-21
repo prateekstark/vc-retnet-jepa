@@ -1,12 +1,83 @@
-"""Multi-speaker dataset loader for Voice Conversion (CMU Arctic / VCTK / custom WAVs)."""
+"""Multi-speaker dataset loader with MFCC Dynamic Time Warping (DTW) alignment for parallel pairs."""
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
+import torch.nn.functional as F
+from scipy.fftpack import dct
 from torch.utils.data import Dataset
 
 from src.audio.mel_vocoder import LogMelFrontend, crop_or_pad, load_wav
+
+
+def dtw_align_mel_a_to_b(mel_a: torch.Tensor, mel_b: torch.Tensor) -> torch.Tensor:
+    """Warp mel_a (1, n_mels, T_a) onto mel_b's timeline (1, n_mels, T_b) using CMVN-MFCC DTW.
+
+    By using cepstral mean-variance normalized MFCCs (c1..c13, excluding c0 energy and high pitch harmonics),
+    the DTW cost is invariant to speaker pitch/timbre and aligns pure phonetic timing.
+    """
+    a_np = mel_a.squeeze(0).cpu().numpy()  # (n_mels, T_a)
+    b_np = mel_b.squeeze(0).cpu().numpy()  # (n_mels, T_b)
+
+    # Extract MFCCs c1..c13 via Type-II DCT along frequency axis
+    mfcc_a = dct(a_np, type=2, axis=0, norm="ortho")[1:14, :]  # (13, T_a)
+    mfcc_b = dct(b_np, type=2, axis=0, norm="ortho")[1:14, :]  # (13, T_b)
+
+    # Cepstral Mean and Variance Normalization (CMVN) per utterance removes speaker timbre bias
+    mfcc_a = (mfcc_a - mfcc_a.mean(axis=1, keepdims=True)) / (mfcc_a.std(axis=1, keepdims=True) + 1e-5)
+    mfcc_b = (mfcc_b - mfcc_b.mean(axis=1, keepdims=True)) / (mfcc_b.std(axis=1, keepdims=True) + 1e-5)
+
+    # L2 normalize frames for cosine distance cost matrix (T_b, T_a)
+    mfcc_a /= np.linalg.norm(mfcc_a, axis=0, keepdims=True) + 1e-6
+    mfcc_b /= np.linalg.norm(mfcc_b, axis=0, keepdims=True) + 1e-6
+    cost = 1.0 - np.dot(mfcc_b.T, mfcc_a)  # (T_b, T_a)
+
+    tb, ta = cost.shape
+    D = np.full((tb + 1, ta + 1), np.inf, dtype=np.float32)
+    D[0, 0] = 0.0
+    # Sakoe-Chiba band constraint (35% of sequence length) for speed and monotonic speech alignment
+    band = max(25, int(max(tb, ta) * 0.35))
+
+    for i in range(1, tb + 1):
+        j_center = int(round(i * ta / tb))
+        j_start = max(1, j_center - band)
+        j_end = min(ta + 1, j_center + band)
+        c_row = cost[i - 1]
+        d_prev = D[i - 1]
+        d_curr = D[i]
+        for j in range(j_start, j_end):
+            d_curr[j] = c_row[j - 1] + min(d_prev[j - 1], d_prev[j], d_curr[j - 1])
+
+    # Backtrack optimal warping path; for each frame i in B, collect aligned frame(s) j in A
+    i, j = tb, ta
+    # If band missed (tb, ta), start from minimum cost in last row
+    if not np.isfinite(D[tb, ta]):
+        j = int(np.argmin(D[tb, 1:])) + 1
+
+    b_to_a_sum = np.zeros((a_np.shape[0], tb), dtype=np.float32)
+    b_to_a_cnt = np.zeros((1, tb), dtype=np.float32)
+
+    while i > 0 and j > 0:
+        b_to_a_sum[:, i - 1] += a_np[:, j - 1]
+        b_to_a_cnt[0, i - 1] += 1.0
+        if i == 1 and j == 1:
+            break
+        diag = D[i - 1, j - 1]
+        up = D[i - 1, j]
+        left = D[i, j - 1]
+        if diag <= up and diag <= left:
+            i -= 1
+            j -= 1
+        elif up <= left:
+            i -= 1
+        else:
+            j -= 1
+
+    b_to_a_cnt = np.maximum(b_to_a_cnt, 1.0)
+    warped_a = b_to_a_sum / b_to_a_cnt
+    return torch.from_numpy(warped_a).unsqueeze(0).to(dtype=mel_a.dtype)
 
 
 class SpeakerMelDataset(Dataset):
@@ -18,10 +89,10 @@ class SpeakerMelDataset(Dataset):
         split: str = "train",
         eval_count: int = 100,
         sample_rate: int = 16000,
-        n_fft: int = 512,
-        hop_length: int = 160,
+        n_fft: int = 1024,
+        hop_length: int = 256,
         n_mels: int = 80,
-        crop_frames: int = 192,
+        crop_frames: int = 128,
         random_crop: bool = True,
     ) -> None:
         self.wav_dir = Path(wav_dir)
@@ -64,17 +135,19 @@ class SpeakerMelDataset(Dataset):
 
 
 class PairedSpeakerDataset(Dataset):
-    """Pairs parallel utterances (x_A, x_B) by utterance stem (e.g. arctic_a0001)."""
+    """Pairs parallel utterances (x_A, x_B) with DTW time-alignment and synchronized crops."""
 
     def __init__(
         self,
         ds_a: SpeakerMelDataset,
         ds_b: SpeakerMelDataset,
         paired_fraction: float = 1.0,
+        random_crop: bool = True,
         seed: int = 42,
     ) -> None:
         self.ds_a = ds_a
         self.ds_b = ds_b
+        self.random_crop = random_crop
 
         common = sorted(set(ds_a.utt_to_idx.keys()) & set(ds_b.utt_to_idx.keys()))
         if not common:
@@ -88,18 +161,39 @@ class PairedSpeakerDataset(Dataset):
             pairs = [pairs[i] for i in perm]
 
         self.pairs: List[Tuple[int, int, str]] = pairs
+        self._dtw_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def __len__(self) -> int:
         return len(self.pairs)
 
+    def _get_aligned_pair(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if idx not in self._dtw_cache:
+            ia, ib, _ = self.pairs[idx]
+            mel_a, _, _, _ = self.ds_a.get_full_mel(ia)
+            mel_b, _, _, _ = self.ds_b.get_full_mel(ib)
+            mel_a_aligned = dtw_align_mel_a_to_b(mel_a, mel_b)
+            self._dtw_cache[idx] = (mel_a_aligned, mel_b)
+        return self._dtw_cache[idx]
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        ia, ib, _ = self.pairs[idx]
-        # Use synchronized center crops for paired training so frames align
-        mel_a, _, _, _ = self.ds_a.get_full_mel(ia)
-        mel_b, _, _, _ = self.ds_b.get_full_mel(ib)
-        spec_a = crop_or_pad(mel_a, self.ds_a.crop_frames, random_crop=False)
-        spec_b = crop_or_pad(mel_b, self.ds_b.crop_frames, random_crop=False)
-        return spec_a, spec_b
+        mel_a_aligned, mel_b = self._get_aligned_pair(idx)
+        target_frames = self.ds_b.crop_frames
+        _, n_mels, t = mel_b.shape
+        if t < target_frames:
+            pad_a = torch.full((1, n_mels, target_frames - t), -1.5, dtype=mel_a_aligned.dtype)
+            pad_b = torch.full((1, n_mels, target_frames - t), -1.5, dtype=mel_b.dtype)
+            return torch.cat([mel_a_aligned, pad_a], dim=-1), torch.cat([mel_b, pad_b], dim=-1)
+        if t == target_frames:
+            return mel_a_aligned, mel_b
+        # Synchronized crop window [start : start + target_frames] on both DTW-aligned spectrograms
+        if self.random_crop:
+            start = int(torch.randint(0, t - target_frames + 1, (1,)).item())
+        else:
+            start = (t - target_frames) // 2
+        return (
+            mel_a_aligned[:, :, start : start + target_frames],
+            mel_b[:, :, start : start + target_frames],
+        )
 
 
 class SyntheticSpeakerDataset(Dataset):
@@ -110,7 +204,7 @@ class SyntheticSpeakerDataset(Dataset):
         num_samples: int = 200,
         speaker: str = "a",
         n_mels: int = 80,
-        crop_frames: int = 192,
+        crop_frames: int = 128,
         seed: int = 42,
     ) -> None:
         super().__init__()

@@ -1,4 +1,4 @@
-"""Scaled-up B -> A Latent Space Converter with Conv-PostNet Cross-Decode & P_A Verification."""
+"""Scaled-up B -> A Latent Space Converter with DTW Paired Cross-Decode, Deep CORAL, & P_A Verification."""
 
 from typing import Dict, Optional, Tuple
 
@@ -48,6 +48,54 @@ def content_self_similarity_loss(z_src: torch.Tensor, z_translated: torch.Tensor
     return F.mse_loss(sim2, sim1)
 
 
+def coral_and_band_moment_loss(
+    z_pred: torch.Tensor,
+    z_real: torch.Tensor,
+    n_freq_patches: int = 10,
+) -> torch.Tensor:
+    """Match per-frequency-band (mean, std) + Deep CORAL covariance between z_pred and z_real."""
+    b, n, d = z_pred.shape
+    t_p = n // n_freq_patches
+
+    # 1. Per-frequency-patch mean & std alignment across (B, T_p)
+    zp_grid = z_pred.view(b, t_p, n_freq_patches, d)
+    zr_grid = z_real.view(b, t_p, n_freq_patches, d)
+
+    mu_p = zp_grid.mean(dim=(0, 1))
+    mu_r = zr_grid.mean(dim=(0, 1))
+    std_p = torch.sqrt(zp_grid.var(dim=(0, 1), unbiased=False) + 1e-4)
+    std_r = torch.sqrt(zr_grid.var(dim=(0, 1), unbiased=False) + 1e-4)
+    moment_loss = F.mse_loss(mu_p, mu_r) + F.mse_loss(std_p, std_r)
+
+    # 2. Deep CORAL second-order feature covariance alignment
+    zp_flat = z_pred.reshape(-1, d)
+    zr_flat = z_real.reshape(-1, d)
+    zp_c = zp_flat - zp_flat.mean(dim=0, keepdim=True)
+    zr_c = zr_flat - zr_flat.mean(dim=0, keepdim=True)
+    cov_p = (zp_c.T @ zp_c) / max(1, zp_flat.shape[0] - 1)
+    cov_r = (zr_c.T @ zr_c) / max(1, zr_flat.shape[0] - 1)
+    coral_loss = F.mse_loss(cov_p, cov_r)
+
+    return moment_loss + 2.0 * coral_loss
+
+
+def spectral_contrast_loss(spec_pred: torch.Tensor, spec_real: torch.Tensor) -> torch.Tensor:
+    """Prevent harmonic over-smoothing by matching per-mel-bin mean/std and frequency/time sharpness."""
+    # spec: (B, 1, F, T)
+    mu_p = spec_pred.mean(dim=(0, 3))
+    mu_r = spec_real.mean(dim=(0, 3))
+    std_p = torch.sqrt(spec_pred.var(dim=(0, 3), unbiased=False) + 1e-4)
+    std_r = torch.sqrt(spec_real.var(dim=(0, 3), unbiased=False) + 1e-4)
+
+    # Frequency-axis local contrast (harmonic peak-to-valley sharpness)
+    df_p = spec_pred[:, :, 1:, :] - spec_pred[:, :, :-1, :]
+    df_r = spec_real[:, :, 1:, :] - spec_real[:, :, :-1, :]
+    df_std_p = torch.sqrt(df_p.var(dim=(0, 3), unbiased=False) + 1e-4)
+    df_std_r = torch.sqrt(df_r.var(dim=(0, 3), unbiased=False) + 1e-4)
+
+    return F.l1_loss(mu_p, mu_r) + F.l1_loss(std_p, std_r) + F.l1_loss(df_std_p, df_std_r)
+
+
 class VoiceLatentConverter(nn.Module):
     """Converts Domain/Speaker B latents onto Domain/Speaker A and decodes via D_A."""
 
@@ -61,6 +109,7 @@ class VoiceLatentConverter(nn.Module):
         lambda_jepa_verify: float = 0.4,
         lambda_cycle: float = 1.0,
         lambda_content_sim: float = 0.5,
+        lambda_coral: float = 0.5,
     ) -> None:
         super().__init__()
         if mode not in ("unpaired", "paired", "hybrid_ac"):
@@ -71,6 +120,7 @@ class VoiceLatentConverter(nn.Module):
         self.lambda_jepa_verify = lambda_jepa_verify
         self.lambda_cycle = lambda_cycle
         self.lambda_content_sim = lambda_content_sim
+        self.lambda_coral = lambda_coral
 
         self.model_a = model_a
         self.model_b = model_b
@@ -118,17 +168,23 @@ class VoiceLatentConverter(nn.Module):
 
         z_hat_a = self.t_b2a(z_b)
 
-        # 1. Frozen P_A Manifold Verification + Content Self-Similarity
+        # 1. Frozen P_A Manifold Verification + Deep CORAL Distribution Matching + Content Self-Similarity
         if self.lambda_jepa_verify > 0.0:
             jepa_ver_a = self.model_a.jepa_manifold_verify_loss(z_hat_a)
             total = total + self.lambda_jepa_verify * jepa_ver_a
             metrics["jepa_verify"] = jepa_ver_a.item()
 
+        coral_loss = coral_and_band_moment_loss(
+            z_hat_a, z_a, n_freq_patches=self.model_a.encoder.n_freq_patches
+        )
+        total = total + self.lambda_coral * coral_loss
+        metrics["coral"] = coral_loss.item()
+
         content_loss = content_self_similarity_loss(z_b, z_hat_a)
         total = total + self.lambda_content_sim * content_loss
         metrics["content_sim"] = content_loss.item()
 
-        # 2. Unpaired Cycle Consistency: B -> A -> B and A -> B -> A
+        # 2. Unpaired Cycle Consistency: B -> A -> B and A -> B -> A + Spectral Contrast Matching
         if self.mode in ("unpaired", "hybrid_ac"):
             x_b2a = self.model_a.decoder(z_hat_a, style_a)
             z_a_cyc, _ = self.model_a.encoder(x_b2a)
@@ -141,16 +197,18 @@ class VoiceLatentConverter(nn.Module):
             z_a_cyc2 = self.t_b2a(z_b_cyc2)
             x_a_rec = self.model_a.decoder(z_a_cyc2, style_a)
 
+            contrast_loss = spectral_contrast_loss(x_b2a, unpaired_a)
             cycle_loss = (
                 F.l1_loss(x_b_rec, unpaired_b)
                 + F.l1_loss(x_a_rec, unpaired_a)
                 + 0.5 * latent_match_loss(z_b_cyc, z_b)
                 + 0.5 * latent_match_loss(z_a_cyc2, z_a)
+                + 0.5 * contrast_loss
             )
             total = total + self.lambda_cycle * cycle_loss
             metrics["cycle"] = cycle_loss.item()
 
-        # 3. Paired Supervision: T_{B->A}(E_B(x_B)) -> E_A(x_A) and D_A(z_hat_A) -> x_A
+        # 3. DTW-Aligned Paired Supervision: T_{B->A}(E_B(x_B)) -> E_A(x_A_dtw) and D_A(z_hat_A) -> x_A_dtw
         if self.mode in ("paired", "hybrid_ac"):
             if pair_a is None or pair_b is None:
                 raise ValueError(f"Mode '{self.mode}' requires (pair_a, pair_b).")
@@ -163,6 +221,7 @@ class VoiceLatentConverter(nn.Module):
             cross_dec_loss = (
                 0.5 * (F.l1_loss(y_pre, pair_a) + 0.5 * F.mse_loss(y_pre, pair_a))
                 + 1.0 * (F.l1_loss(y_post, pair_a) + 0.5 * F.mse_loss(y_post, pair_a))
+                + 0.4 * spectral_contrast_loss(y_post, pair_a)
             )
 
             total = total + self.lambda_latent * lat_loss + self.lambda_cross_decode * cross_dec_loss

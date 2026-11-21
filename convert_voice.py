@@ -67,7 +67,7 @@ def main() -> None:
             n_fft=a_cfg["n_fft"], hop_length=a_cfg["hop_length"],
             n_mels=a_cfg["n_mels"], crop_frames=a_cfg["crop_frames"], random_crop=False,
         )
-        ds_eval = PairedSpeakerDataset(ds_a, ds_b)
+        ds_eval = PairedSpeakerDataset(ds_a, ds_b, random_crop=False)
     else:
         ds_a = SyntheticSpeakerDataset(50, speaker="a", n_mels=a_cfg["n_mels"], crop_frames=a_cfg["crop_frames"], seed=cfg["seed"] + 1)
         ds_b = SyntheticSpeakerDataset(50, speaker="b", n_mels=a_cfg["n_mels"], crop_frames=a_cfg["crop_frames"], seed=cfg["seed"] + 1)
